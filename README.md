@@ -1,28 +1,28 @@
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/Paco8/plugin.video.movistarplus)
 ![GitHub all releases](https://img.shields.io/github/downloads/Paco8/plugin.video.movistarplus/total)
 
-# Movistarplus for Kodi
+# Movistar+ Nueva API for Kodi
 
 _This addon is not officially commissioned/supported by Movistar. All product names, logos, and trademarks mentioned in this project are property of their respective owners._
 
 ## Description
-Watch live channels, recordings and video on demand content from Movistarplus Spain in Kodi. Requires a subscription.
-This addon is compatible with Kodi 18, 19 and 20.
+Fork of Movistarplus for Kodi adapted to the new `soter-*` API. It uses addon id `plugin.video.movistarplus.newapi`, so it can be installed alongside the original addon. Requires a subscription.
+This addon targets Kodi 19+ / Python 3.
 
 ---
 
 ## Descripción
-Con este addon puedes ver los canales en directo, grabaciones, últimos 7 días y TV a la carta de Movistarplus España en Kodi. Es necesario estar abonado.
-El addon es compatible con Kodi 18, 19 y 20.
+Fork de Movistarplus para Kodi adaptado a la nueva API `soter-*`. Usa el id `plugin.video.movistarplus.newapi`, por lo que puede instalarse junto al addon original. Es necesario estar abonado.
+El addon está orientado a Kodi 19+ / Python 3.
 
 ## Instalación
 ### Instalación manual
-Descarga `script.module.ttml2ssa-x.x.x.zip` y `plugin.video.movistarplus-x.x.x.zip` de [la página Releases](https://github.com/Paco8/plugin.video.movistarplus/releases) e instálalos en Kodi en ese orden.
+Descarga `script.module.ttml2ssa-x.x.x.zip` y `plugin.video.movistarplus.newapi-x.x.x.zip` de la página Releases del fork e instálalos en Kodi en ese orden.
 
 ### Instalación por repositorio
 - Añade esta URL como fuente en Kodi: `https://paco8.github.io/kodi-repo/`
 - En addons selecciona la opción _Instalar desde un archivo zip_ e instala desde la fuente anterior el paquete **repository.spain**
-- Ahora en _Instalar desde repositorio_ entra en _Spain OTT repository_, _Addons de vídeo_ e instala **Movistar+**
+- Para esta variante paralela, instala **Movistar+ Nueva API** desde el zip del fork.
 
 ## Inicio de sesión
 Tras la instalación, la primera vez que entres en el addon tienes que ir a la opción `Cuentas` y seleccionar la opción `Iniciar sesión con nombre y clave`. Después vuelve al menú principal, y si las credenciales son correctas ya podrás empezar a disfrutar Movistarplus en Kodi.

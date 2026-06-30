@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.movistarplus"
-       name="Movistar+"
-       version="0.11.6"
-       provider-name="Paco8">
+<addon id="plugin.video.movistarplus.newapi"
+       name="Movistar+ Nueva API"
+       version="0.12.0-newapi.1"
+       provider-name="Paco8, Marcos Fernández Panero">
   <requires>
   <!--- <import addon="xbmc.python" version="2.25.0"/> -->
   <import addon="script.module.requests"/>
@@ -18,16 +18,16 @@
   <extension point="xbmc.service" library="service.py" />
 
   <extension point="xbmc.addon.metadata">
-    <summary lang="en_GB">Movistar+</summary>
-    <description lang="en_GB">Movistar+</description>
-    <description lang="en_GB">Watch live channels, recordings and video on demand content from Movistar+ in Kodi. Requires a subscription.</description>
-    <description lang="es_ES">Vea canales en directo, grabaciones, U7D y TV a la carta de Movistar+ en Kodi. Se necesita estar abonado.</description>
+    <summary lang="en_GB">Movistar+ Nueva API</summary>
+    <description lang="en_GB">Movistar+ Nueva API</description>
+    <description lang="en_GB">Fork of Movistar+ for Kodi adapted to the new soter API. Installs alongside the original addon and requires a subscription.</description>
+    <description lang="es_ES">Fork de Movistar+ para Kodi adaptado a la nueva API soter. Se instala junto al addon original y requiere estar abonado.</description>
     <disclaimer lang="en_GB">This addon is not officially commissioned/supported by Movistar+. All product names, logos, and trademarks mentioned in this project are property of their respective owners.</disclaimer>
     <disclaimer lang="es_ES">Este addon no ha sido realizado ni apoyado por Movistar+. Todos los nombres de productos, logotipos y marcas registradas mencionados en este proyecto son propiedad de sus respectivos dueños.</disclaimer>
     <platform>all</platform>
     <license>LGPL-2.1-or-later</license>
     <website></website>
-    <source></source>
+    <source>https://github.com/marcosfernandezpanero/plugin.video.movistarplus</source>
     <assets>
       <icon>icon.png</icon>
       <fanart>resources/fanart.png</fanart>

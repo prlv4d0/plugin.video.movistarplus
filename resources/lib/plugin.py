@@ -779,7 +779,7 @@ def create_iptv_settings():
     if os.path.exists(filename):
       res = xbmcgui.Dialog().yesno(addon.getLocalizedString(30322), addon.getLocalizedString(30323))
       if res == False: return
-    save_iptv_settings(filename, 'Movistarplus', 'movistarplus', epg_url)
+    save_iptv_settings(filename, 'Movistarplus Nueva API', 'movistarplus.newapi', epg_url)
     export_epg_now()
   except:
     show_notification(addon.getLocalizedString(30324))

@@ -29,7 +29,7 @@ def export_epg():
   LOG('channels_needs_update: {} epg_needs_update: {}'.format(channels_needs_update, epg_needs_update))
 
   if channels_needs_update or epg_needs_update:
-    xbmc.executebuiltin('RunPlugin(plugin://plugin.video.movistarplus/?action=export_epg_now)')
+    xbmc.executebuiltin('RunPlugin(plugin://plugin.video.movistarplus.newapi/?action=export_epg_now)')
 
 if __name__ == '__main__':
   LOG('Service started')

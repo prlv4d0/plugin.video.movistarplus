@@ -1,5 +1,5 @@
 VERSION = $(shell ./get_version.py)
-OUTPUT_DIR = plugin.video.movistarplus-$(VERSION)
+OUTPUT_DIR = plugin.video.movistarplus.newapi-$(VERSION)
 OUTPUT_FILE = $(OUTPUT_DIR).zip
 
 install:
@@ -28,11 +28,11 @@ install:
 	#install -m 644 resources/skins/default/media/*.jpg $(OUTPUT_DIR)/resources/skins/default/media/
 
 	zip -9 -r $(OUTPUT_FILE) $(OUTPUT_DIR)/
-	- ln -s $(OUTPUT_DIR)/ plugin.video.movistarplus-latest
+	- ln -s $(OUTPUT_DIR)/ plugin.video.movistarplus.newapi-latest
 
 clean:
 	-rm -rf $(OUTPUT_DIR)/
 	-rm $(OUTPUT_FILE)
 	-rm *.pyo *.pyc
 	-rm resources/lib/*.pyo resources/lib/*.pyc
-	-rm plugin.video.movistarplus-latest
+	-rm plugin.video.movistarplus.newapi-latest

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # encoding: utf-8
 #
 # SPDX-License-Identifier: LGPL-2.1-or-later
@@ -13,5 +13,4 @@ with io.open('addon.xml', 'r', encoding='utf-8') as handle:
   m = re.search(r'movistar.*?version="(.*?)"', text, re.DOTALL)
   if m:
     print(m.group(1))
-
 

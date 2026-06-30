@@ -1729,7 +1729,7 @@ class Movistar(object):
         t['logo'] = c['art']['icon']
         t['preset'] = c['dial']
         args = urlencode({'action': 'play', 'stype': 'tv', 'id': c['id'], 'url': c['url'], 'session_request': c['session_request']})
-        t['stream'] = 'plugin://plugin.video.movistarplus/?' + args
+        t['stream'] = 'plugin://plugin.video.movistarplus.newapi/?' + args
         if 'cas_id' in c: t['cas_id'] = c['cas_id']
         res.append(t)
       return res
@@ -1871,7 +1871,7 @@ class Movistar(object):
             url = 'https://grmovistar.imagenio.telefonica.net/asfe/rest/tvMediaURLs?tvProgram.id='+ program_id +'&svc=startover'
             session_request = '{"contentID":' + program_id +',"streamType":"CUTV"}'
             args = urlencode({'action': 'play', 'stype': 'u7d', 'id': program_id, 'url': url, 'session_request': session_request})
-            t['stream'] = 'plugin://plugin.video.movistarplus/?' + args
+            t['stream'] = 'plugin://plugin.video.movistarplus.newapi/?' + args
 
           if False and self.add_extra_info and id in ['HOLLYW', 'TCM', 'AMC', 'MV3', 'MV2', 'CPSER', 'FOXGE', 'TNT']:
             i = {'id': e['id'], 'show_id': e['show_id']}

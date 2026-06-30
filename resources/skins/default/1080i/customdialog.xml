@@ -43,7 +43,7 @@
             <width>1030</width>
             <height>70</height>
             <font>font20_title</font>
-            <label>[B]$INFO[System.AddonTitle(plugin.video.movistarplus)][/B]</label>
+            <label>[B]$INFO[System.AddonTitle(plugin.video.movistarplus.newapi)][/B]</label>
             <align>center</align>
             <aligny>center</aligny>
             <shadowcolor>FF000000</shadowcolor>
