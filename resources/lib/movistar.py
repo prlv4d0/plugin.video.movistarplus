@@ -13,15 +13,30 @@ import time
 import re
 import shutil
 import glob
+import uuid
+import traceback
 
 from datetime import datetime, timedelta
 
 from .endpoints import endpoints
-from .log import LOG, print_json
+from .log import LOG, INFO, ERROR, print_json
 from .network import Network
 from .cache import Cache
 from .timeconv import *
 from .useragent import useragent
+from . import curl_http
+from .movistar_auth import (
+    WEB_CLIENT_ID,
+    WEB_CLIENT_SECRET,
+    MovistarAuthError,
+    default_headers,
+    decode_jwt,
+    fetch_webplayer_credentials,
+    generate_basic_token,
+    signed_headers,
+    token_expired,
+    token_expire_date,
+)
 
 class Movistar(object):
     account = {'username': '', 'password': '',
@@ -37,32 +52,24 @@ class Movistar(object):
                'demarcation': 0}
 
     add_extra_info = True
-    #dplayer = 'webplayer'
-    #device_code = 'WP_OTT'
-    #manufacturer = 'Firefox'
-    dplayer = 'amazon.tv'
-    device_code = 'SMARTTV_OTT'
-    manufacturer = 'LG'
+    dplayer = 'webplayer'
+    device_code = 'WP_DASH'
+    manufacturer = 'Chrome'
     account_dir = 'account_1'
 
     def __init__(self, config_directory, reuse_devices=False):
+      self.account = dict(Movistar.account)
       self.logged = False
       self.expired_access_token = False
+      self.uses_new_api = True
+      self.entitlements = self.empty_entitlements()
 
-      # Network
-      headers = {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'es-ES,es;q=0.9',
-        'Origin': 'https://ver.movistarplus.es',
-        'Referer': 'https://ver.movistarplus.es/',
-        'User-Agent': useragent
-      }
       self.net = Network()
-      self.net.headers = headers
+      self.net.headers = default_headers(None)
+      self.net.headers['Accept'] = 'application/json, text/javascript, */*; q=0.01'
 
       self.quality = 'HD' # or UHD
 
-      # Account dir
       content = Movistar.load_file_if_exists(config_directory + 'account.txt')
       if content: self.account_dir = content
       LOG('account_dir: {}'.format(self.account_dir))
@@ -70,325 +77,512 @@ class Movistar(object):
       account_dir = os.path.join(config_directory, self.account_dir)
       if not os.path.exists(account_dir):
         os.makedirs(account_dir)
-        # Migrate data
         if self.account_dir == 'account_1':
           for ext in ['*.conf', '*.json', '*.key']:
             for f in glob.glob(os.path.join(config_directory, ext)):
-              #LOG(f)
               shutil.move(f, account_dir)
           if os.path.exists(config_directory + 'cache'):
-            #LOG(config_directory + 'cache')
             shutil.move(config_directory + 'cache', account_dir)
 
       self.config_dir = config_directory
       config_directory = account_dir + '/'
 
-      # Cache
       self.cache = Cache(config_directory)
       if not os.path.exists(config_directory + 'cache'):
         os.makedirs(config_directory + 'cache')
 
-      # Endpoints
       self.endpoints = endpoints
 
-      # Access token
-      self.load_key_file() # Default access_token
-      if self.account['access_token']:
-        exp = self.get_token_expire_date(self.account['access_token'])
-        #LOG('auth.key: expiring date: {}'.format(exp))
-        if exp < time.time():
-          self.expired_access_token = True
-          self.account['access_token'] = None
-
-      content = self.cache.load_file('access_token.conf')
-      if content:
-        exp = self.get_token_expire_date(content)
-        #LOG('access_token.conf: expiring date: {}'.format(exp))
-        if exp < time.time():
-          self.expired_access_token = True
-        else:
-          self.account['access_token'] = content
-      #LOG('access_token: {}'.format(self.account['access_token']))
-      LOG('expired_access_token: {}'.format(self.expired_access_token))
-
-      if not self.account['access_token']: return
-
-      # Account
-      data = None
-      content = self.cache.load('account.json')
-      if content:
-        data = json.loads(content)
-      if not data or 'ofertas' not in data:
-        data = self.get_account_info()
-        if not data or 'ofertas' not in data: return
-        self.cache.save_file('account.json', json.dumps(data, ensure_ascii=False))
-      self.account['id'] = data['ofertas'][0]['accountNumber']
-      #self.account['pid'] = data['ofertas'][0]['cod_persona']
-      self.account['encoded_user'] = data['cod_usuario_cifrado']
-      self.account['platform'] = data['ofertas'][0]['@id_perfil']
-      #self.account['platform'] = 'OTT'
-
-      # Profile ID
       content = self.cache.load_file('profile_id.conf')
       if content:
         self.account['profile_id'] = content
 
-      # Device ID
-      self.account['device_id'] = self.cache.load_file('device_id.conf')
-      if self.account['device_id']:
-        self.account['device_id'] = self.account['device_id'].strip('"')
-      else:
-        # Create new device
-        if not reuse_devices:
-          LOG('not reusing devices')
-          if not self.account['device_id']:
-            self.account['device_id'] = self.request_device_id()
-            self.cache.save_file('device_id.conf', self.account['device_id'])
-        else:
-          LOG('reusing devices')
-          # Check if device is registered
-          device_list = self.get_devices()
-          found_device = False
-          wp_device = None
-          for device in device_list:
-            if not wp_device: # and device['type_code'] == 'WP':
-              wp_device = device['id']
-            if device['id'] == self.account['device_id']:
-              found_device = True
-              break
-          if not found_device:
-            if wp_device:
-              LOG('device not found, using {}'.format(wp_device))
-              self.account['device_id'] = wp_device
-            else:
-              LOG('device not found, registering new device')
-              self.account['device_id'] = self.request_device_id()
-            self.cache.save_file('device_id.conf', self.account['device_id'])
-      LOG('device_id: {}'. format(self.account['device_id']))
+      tokens = self.load_tokens()
+      if tokens:
+        if token_expired(tokens.get('accessToken_init')):
+          self.expired_access_token = True
+          self.renew_init_tokens(tokens)
+          tokens = self.load_tokens()
+        self.apply_tokens(tokens)
 
-      # Tokens
-      content = self.cache.load('tokens.json', 5)
-      if content:
-        data = json.loads(content)
-      else:
-        LOG('Loading tokens')
-        data = self.get_token()
-        if 'error' in data and self.account['device_id']:
-          # Try registering the device
-          self.register_device()
-          data = self.get_token()
-        #print_json(data)
-        if 'accessToken' in data:
-          self.cache.save_file('tokens.json', json.dumps(data, ensure_ascii=False))
-          self.cache.save_file('access_token.conf', data['accessToken'])
-
-      self.account['session_token'] = ''
-      self.account['ssp_token'] = ''
-
-      self.entitlements = {}
-
-      if 'accessToken' in data:
-        self.account['access_token'] = data['accessToken']
-        self.account['session_token'] = data['token']
-        self.account['ssp_token'] = data['sspToken']
-        self.account['demarcation'] = data['demarcation']
-        self.account['pid'] = data['pid']
-
-        self.entitlements['activePurchases'] = data['activePurchases']
-        self.entitlements['partners'] = data['partners']
-        self.entitlements['activePackages'] = data['activePackages']
-        self.entitlements['vodSubscription'] = data['vodSubscription'].split(',') if data['linearSubscription'] else []
-        self.entitlements['linearSubscription'] = data['linearSubscription'].split(',') if data['linearSubscription'] else []
-        self.entitlements['suscripcion'] = data['suscripcion']
-        self.entitlements['tvRights'] = data['tvRights']
-        self.entitlements['distilledTvRights'] = data['distilledTvRights']
-        #print_json(self.entitlements)
-        self.logged = True
-
-      # Search
       data = self.cache.load_file('searchs.json')
       self.search_list = json.loads(data) if data else []
 
-    def get_token(self):
-      data = {"accountNumber": self.account['id'],
-              "userProfile": self.account['profile_id'],
-              "streamMiscellanea":"HTTPS",
-              "deviceType": self.device_code,
-              "deviceManufacturerProduct": self.manufacturer,
-              "streamDRM":"Widevine",
-              "streamFormat":"DASH",
+    def empty_entitlements(self):
+      return {
+        'activePurchases': [],
+        'partners': [],
+        'activePackages': [],
+        'vodSubscription': [],
+        'linearSubscription': [],
+        'suscripcion': '',
+        'tvRights': [],
+        'distilledTvRights': [],
       }
 
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      #headers['X-Movistarplus-Ui'] = '2.36.30'
-      #headers['X-Movistarplus-Os'] = 'Linux88'
-      headers['X-Movistarplus-Deviceid'] = self.account['device_id']
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      #print_json(data)
-      #print_json(headers)
-
-      url = self.endpoints['initdata'].format(deviceType=self.dplayer, DEVICEID=self.account['device_id'])
-      response = self.net.session.post(url, data=json.dumps(data), headers=headers)
-      content = response.content.decode('utf-8')
-      LOG('get_token response: {}'.format(content))
+    def load_tokens(self):
+      content = self.cache.load_file('tokens.json')
+      if not content:
+        return {}
       try:
-        d = json.loads(content)
-      except:
-        d = {'error': content}
-      return d
-
-    def clear_session(self):
-      headers = self.net.headers.copy()
-      headers['Access-Control-Request-Method'] = 'POST'
-      headers['Access-Control-Request-Headers'] = 'content-type,x-hzid'
-      url = self.endpoints['setUpStream'].format(PID=self.account['pid'], deviceCode=self.device_code, PLAYREADYID=self.account['device_id'])
-      response = self.net.session.options(url, headers=headers)
-      content = response.content.decode('utf-8')
-      return content
-
-    def open_session(self, data, session_token=None, session_id=None):
-      if not session_token:
-        session_token = self.account['session_token']
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      headers['X-Hzid'] = session_token
-      url = self.endpoints['setUpStream'].format(PID=self.account['pid'], deviceCode=self.device_code, PLAYREADYID=self.account['device_id'])
-      if session_id != None:
-         url += '/' + session_id
-      #LOG('open_session: url: {}'.format(url))
-      #LOG('open_session: data: {}'.format(data))
-      response = self.net.session.post(url, data=data, headers=headers)
-      content = response.content.decode('utf-8')
-      try:
-        d = json.loads(content)
-      except:
-        d = None
-      #LOG("open_session: response: {}".format(d))
-      return d
-
-    def login(self, username, password):
-      headers = self.net.headers.copy()
-      if self.account['device_id']:
-        headers['x-movistarplus-deviceid'] = self.account['device_id']
-      #headers['x-movistarplus-ui'] = '2.36.30'
-      #headers['x-movistarplus-os'] = 'Linux88'
-      #LOG(headers)
-
-      data = {
-          'grant_type': 'password',
-          'deviceClass': self.dplayer,
-          'username': username,
-          'password': password,
-      }
-      #LOG(data)
-
-      url = self.endpoints['token'].format(deviceType=self.dplayer)
-      #LOG(url)
-
-      response = self.net.session.post(url, headers=headers, data=data)
-      content = response.content.decode('utf-8')
-      LOG(content)
-      success = False
-      try:
-        d = json.loads(content)
-        if 'access_token' in d:
-          success = True
-          self.save_key_file(d)
-      except:
-        pass
-      return success, content
-
-    def get_account_info(self):
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/x-www-form-urlencoded'
-      #headers['x-movistarplus-deviceid'] = self.account['device_id']
-      #headers['x-movistarplus-ui'] = '2.36.30'
-      #headers['x-movistarplus-os'] = 'Linux88'
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = self.endpoints['autenticacion_tk'].format(deviceType=self.dplayer) + '?_=' + str(int(time.time()*1000))
-      #LOG(url)
-      #LOG('get_account_info: headers: {}'.format(headers))
-      data = self.net.load_data(url, headers)
-      #LOG('get_account_info: data: {}'.format(data))
+        data = json.loads(content)
+      except Exception:
+        return {}
+      if 'accessToken' in data and 'accessToken_init' not in data:
+        LOG('Ignoring legacy tokens.json')
+        return {}
       return data
 
-    def change_device(self, id):
-      self.account['device_id'] = id
-      self.cache.save_file('device_id.conf', self.account['device_id'])
-      self.cache.remove_file('tokens.json')
+    def save_tokens(self, data):
+      self.cache.save_file('tokens.json', json.dumps(data, ensure_ascii=False))
 
-    def get_devices(self):
-      headers = self.net.headers.copy()
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = self.endpoints['obtenerdipositivos'].format(ACCOUNTNUMBER=self.account['id'])
-      data = self.net.load_data(url, headers)
-      #print_json(data)
-      if not isinstance(data, list): return []
+    def cleanup_legacy_auth_files(self):
+      for filename in ['auth.key', 'access_token.conf', 'cdn.conf']:
+        self.cache.remove_file(filename)
+
+    def apply_tokens(self, data):
+      account_info = data.get('account_info') or {}
+      init_data = data.get('init_data') or {}
+      ofertas = account_info.get('ofertas') or []
+      oferta = ofertas[0] if ofertas else {}
+
+      self.account['username'] = data.get('username', '')
+      self.account['id'] = data.get('account_nbr') or oferta.get('accountNumber')
+      self.account['encoded_user'] = account_info.get('cod_usuario_cifrado', '')
+      self.account['profile_id'] = str(data.get('profile_id', self.account.get('profile_id') or '0'))
+      self.account['platform'] = oferta.get('@id_perfil') or data.get('client_segment') or 'OTT'
+      self.account['device_id'] = data.get('device_id_actual') or ''
+      self.account['access_token'] = data.get('accessToken_init') or ''
+      self.account['session_token'] = init_data.get('token', '')
+      self.account['ssp_token'] = data.get('sspToken_init') or init_data.get('sspToken', '')
+      self.account['demarcation'] = init_data.get('demarcation', 0)
+      self.account['pid'] = init_data.get('pid')
+
+      self.entitlements = self.empty_entitlements()
+      for key in ['activePurchases', 'partners', 'activePackages',
+                  'tvRights', 'distilledTvRights']:
+        value = init_data.get(key, [])
+        self.entitlements[key] = value if isinstance(value, list) else []
+      linear = init_data.get('linearSubscription') or ''
+      vod = init_data.get('vodSubscription') or ''
+      self.entitlements['linearSubscription'] = linear.split(',') if isinstance(linear, str) and linear else []
+      self.entitlements['vodSubscription'] = vod.split(',') if isinstance(vod, str) and vod else []
+      self.entitlements['suscripcion'] = init_data.get('suscripcion', '')
+
+      self.logged = bool(self.account['id'] and self.account['device_id'] and self.account['access_token'])
+      self.expired_access_token = token_expired(self.account['access_token']) if self.account['access_token'] else False
+      if self.account['device_id']:
+        self.cache.save_file('device_id.conf', self.account['device_id'])
+      if account_info:
+        self.cache.save_file('account.json', json.dumps(account_info, ensure_ascii=False))
+
+    def get_consumer_credentials(self):
+      return fetch_webplayer_credentials(self.net.session, self.cache)
+
+    def new_api_headers(self, content_type='application/json'):
+      headers = default_headers(content_type)
+      headers['Accept'] = 'application/json, text/javascript, */*; q=0.01'
+      return headers
+
+    def signed_api_headers(self, method, url, token, scheme, content_type='application/json',
+                           extra=None, params=None):
+      consumer_key, consumer_secret = self.get_consumer_credentials()
+      headers = self.new_api_headers(content_type)
+      return signed_headers(method, url, token, scheme, consumer_key,
+                            consumer_secret, headers, extra, params)
+
+    def is_f5_forbidden(self, response):
+      if response.status_code != 403:
+        return False
+      content = response.content[:500].decode('utf-8', 'replace')
+      return 'F5 site:' in content or 'The requested URL was rejected' in content
+
+    def api_request(self, method, url, headers=None, data=None, json_data=None,
+                    allow_redirects=True, force_curl=False):
+      method = method.upper()
+      if force_curl:
+        return curl_http.request(
+          method, url, headers=headers, data=data, json_data=json_data)
+
+      try:
+        if method == 'GET':
+          response = self.net.session.get(url, headers=headers, allow_redirects=allow_redirects)
+        elif method == 'POST':
+          if json_data is not None:
+            response = self.net.session.post(url, json=json_data, headers=headers)
+          else:
+            response = self.net.session.post(url, data=data, headers=headers)
+        elif method == 'PUT':
+          response = self.net.session.put(url, headers=headers)
+        elif method == 'DELETE':
+          response = self.net.session.delete(url, headers=headers)
+        else:
+          raise ValueError('Método HTTP no soportado: {}'.format(method))
+      except Exception as exc:
+        INFO('new api request failed with requests; retrying with curl: {}'.format(exc))
+        return curl_http.request(
+          method, url, headers=headers, data=data, json_data=json_data)
+
+      if self.is_f5_forbidden(response):
+        INFO('new api request blocked by F5 with requests; retrying with curl')
+        try:
+          return curl_http.request(
+            method, url, headers=headers, data=data, json_data=json_data)
+        except Exception as exc:
+          ERROR('curl fallback failed: {}'.format(exc))
+      return response
+
+    def response_json(self, response):
+      content = response.content.decode('utf-8')
+      try:
+        return json.loads(content)
+      except Exception:
+        return {'error': content, 'status_code': response.status_code}
+
+    def safe_error_message(self, result):
+      if isinstance(result, dict):
+        for key in ['error_description', 'message', 'error', 'resultText']:
+          value = result.get(key)
+          if value:
+            return str(value)
+        return json.dumps({k: result[k] for k in result if k not in ['access_token', 'accessToken', 'sspToken', 'legacyAccessToken']})
+      return str(result)
+
+    def init_payload(self, account_nbr, device_id):
+      return {
+        'accountNumber': str(account_nbr),
+        'sessionUserProfile': int(self.account.get('profile_id') or 0),
+        'isKidProfile': False,
+        'deviceId': str(device_id),
+        'streamMiscellanea': 'HTTPS',
+        'deviceManufacturerProduct': self.manufacturer,
+        'streamDRM': 'Widevine',
+        'streamFormat': 'DASH',
+      }
+
+    def request_login_token(self, username, password, device_id):
+      INFO('new api login step: token request')
+      url = self.endpoints['token']
+      data = {
+        'grant_type': 'password',
+        'username': username,
+        'password': password,
+        'scope': 'api',
+        'client_id': WEB_CLIENT_ID,
+        'client_secret': WEB_CLIENT_SECRET,
+      }
+      basic_token = generate_basic_token(device_id)
+      headers = self.signed_api_headers(
+        'POST', url, basic_token, 'Basic',
+        content_type='application/x-www-form-urlencoded',
+        extra={'Host': 'soter-pf.sve.video.telefonicaservices.com'},
+        params=data)
+      response = self.api_request('POST', url, data=data, headers=headers)
+      result = self.response_json(response)
+      INFO('new api login step: token response {}'.format(response.status_code))
+      if response.status_code != 200:
+        raise MovistarAuthError('token {}: {}'.format(
+          response.status_code, self.safe_error_message(result)))
+      token = result.get('access_token')
+      if not token:
+        raise MovistarAuthError('Login sin access_token.')
+      return token
+
+    def request_account_info(self, access_token_login):
+      INFO('new api login step: accountInfo request')
+      url = self.endpoints['account_info']
+      headers = self.signed_api_headers(
+        'GET', url, access_token_login, 'Bearer',
+        extra={'Host': 'soter-pf.sve.video.telefonicaservices.com'})
+      response = self.api_request('GET', url, headers=headers, allow_redirects=True)
+      result = self.response_json(response)
+      INFO('new api login step: accountInfo response {}'.format(response.status_code))
+      if response.status_code != 200:
+        raise MovistarAuthError('accountInfo {}: {}'.format(
+          response.status_code, self.safe_error_message(result)))
+      return result
+
+    def put_device_id(self, device_id, access_token_login, account_nbr):
+      INFO('new api login step: device register request')
+      url = self.endpoints['register_device'].format(
+        DEVICEID=device_id, ACCOUNTNUMBER=account_nbr)
+      headers = self.signed_api_headers(
+        'PUT', url, access_token_login, 'Bearer',
+        extra={'Host': 'soter-pf.sve.video.telefonicaservices.com'})
+      response = self.api_request('PUT', url, headers=headers)
+      INFO('new api login step: device register response {}'.format(response.status_code))
+      if response.status_code in (200, 201, 409):
+        return True
+      ERROR('put_device_id failed: {} {}'.format(response.status_code, response.content[:500]))
+      return False
+
+    def request_init_data(self, access_token, account_nbr, device_id):
+      INFO('new api login step: initData request')
+      url = self.endpoints['initdata']
+      headers = self.signed_api_headers(
+        'POST', url, access_token, 'Bearer',
+        extra={'Host': 'soter-pf.sve.video.telefonicaservices.com'})
+      response = self.api_request(
+        'POST', url, json_data=self.init_payload(account_nbr, device_id), headers=headers)
+      result = self.response_json(response)
+      INFO('new api login step: initData response {}'.format(response.status_code))
+      if response.status_code != 200:
+        raise MovistarAuthError('initData {}: {}'.format(
+          response.status_code, self.safe_error_message(result)))
+      return result
+
+    def request_tcdn_token(self, access_token_init, account_nbr):
+      INFO('new api login step: tcdn request')
+      url = self.endpoints['renovacion_cdntoken2'].format(ACCOUNTNUMBER=account_nbr)
+      headers = self.signed_api_headers(
+        'POST', url, access_token_init, 'Bearer',
+        extra={'Host': 'soter-pf.sve.video.telefonicaservices.com'})
+      response = self.api_request('POST', url, headers=headers, force_curl=True)
+      if response.status_code >= 500:
+        time.sleep(1)
+        response = self.api_request('POST', url, headers=headers, force_curl=True)
+      result = self.response_json(response)
+      INFO('new api login step: tcdn response {}'.format(response.status_code))
+      if response.status_code != 200:
+        raise MovistarAuthError('tcdn {}: {}'.format(
+          response.status_code, self.safe_error_message(result)))
+      return result.get('access_token', '')
+
+    def build_token_state(self, username, password, device_id, access_token_login,
+                          account_info, init_data, tcdn_token):
+      oferta = (account_info.get('ofertas') or [{}])[0]
+      account_nbr = oferta.get('accountNumber')
+      access_token_init = init_data.get('accessToken')
+      payload = decode_jwt(access_token_init)
+      if not account_nbr:
+        account_nbr = payload.get('id') or payload.get('accountNumber')
+      client_segment = payload.get('s') or payload.get('clientSegment')
+      return {
+        'username': username,
+        'account_nbr': account_nbr,
+        'device_id_actual': device_id,
+        'client_segment': client_segment,
+        'access_token_login': access_token_login,
+        'accessToken_init': access_token_init,
+        'legacyAccessToken_init': init_data.get('legacyAccessToken'),
+        'sspToken_init': init_data.get('sspToken'),
+        'access_token_tcdn': tcdn_token,
+        'profile_id': self.account.get('profile_id') or '0',
+        'account_info': account_info,
+        'init_data': init_data,
+        'accessToken_init_lista': [{
+          'device_id': device_id,
+          'accessToken_init': access_token_init,
+          'fecha_obtencion': datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+          'expira': self.token_expire_string(access_token_init),
+          'ultimo_uso': datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+          'ssp': bool(init_data.get('sspToken')),
+          'device_type': 'Web',
+          'device_type_code': 'WP_DASH',
+        }],
+      }
+
+    def token_expire_string(self, token):
+      exp = token_expire_date(token)
+      if not exp:
+        return 'Desconocida'
+      return datetime.fromtimestamp(exp).strftime('%d/%m/%Y %H:%M:%S')
+
+    def login(self, username, password):
+      INFO('new api login started')
+      device_id = self.account.get('device_id') or self.cache.load_file('device_id.conf')
+      if device_id:
+        device_id = device_id.strip('"')
+      else:
+        device_id = uuid.uuid4().hex
+
+      try:
+        access_token_login = self.request_login_token(username, password, device_id)
+        account_info = self.request_account_info(access_token_login)
+        account_nbr = (account_info.get('ofertas') or [{}])[0].get('accountNumber')
+        if not account_nbr:
+          raise MovistarAuthError('No se pudo obtener el número de cuenta.')
+        if not self.put_device_id(device_id, access_token_login, account_nbr):
+          raise MovistarAuthError('No se pudo registrar el dispositivo.')
+        init_data = self.request_init_data(access_token_login, account_nbr, device_id)
+        access_token_init = init_data.get('accessToken')
+        if not access_token_init:
+          raise MovistarAuthError('initData no devolvió accessToken.')
+        try:
+          tcdn_token = self.request_tcdn_token(access_token_init, account_nbr)
+        except Exception as exc:
+          ERROR('new api login tcdn token failed, continuing without CDN token: {}'.format(exc))
+          tcdn_token = ''
+        data = self.build_token_state(
+          username, password, device_id, access_token_login, account_info,
+          init_data, tcdn_token)
+        self.cleanup_legacy_auth_files()
+        self.save_tokens(data)
+        self.apply_tokens(data)
+        INFO('new api login finished')
+        return True, json.dumps({'ok': True})
+      except Exception as exc:
+        ERROR('new api login failed: {}'.format(exc))
+        ERROR(traceback.format_exc())
+        return False, str(exc)
+
+    def get_account_info(self):
+      tokens = self.load_tokens()
+      return tokens.get('account_info') or {}
+
+    def change_device(self, id):
+      tokens = self.load_tokens()
+      for item in tokens.get('accessToken_init_lista', []):
+        if item.get('device_id') == id and item.get('accessToken_init'):
+          tokens['device_id_actual'] = id
+          tokens['accessToken_init'] = item['accessToken_init']
+          try:
+            init_data = self.request_init_data(item['accessToken_init'], tokens.get('account_nbr'), id)
+            tokens['init_data'] = init_data
+            tokens['accessToken_init'] = init_data.get('accessToken') or item['accessToken_init']
+            tokens['legacyAccessToken_init'] = init_data.get('legacyAccessToken')
+            tokens['sspToken_init'] = init_data.get('sspToken')
+          except Exception as exc:
+            LOG('change_device init refresh failed: {}'.format(exc))
+          self.save_tokens(tokens)
+          self.apply_tokens(tokens)
+          return
+      self.account['device_id'] = id
+      self.cache.save_file('device_id.conf', id)
+
+    def normalize_devices(self, data):
+      if isinstance(data, dict):
+        for key in ['devices', 'deviceList', 'items', 'data', 'result']:
+          if isinstance(data.get(key), list):
+            data = data[key]
+            break
+      if not isinstance(data, list):
+        return []
       res = []
       for d in data:
-        if d.get('Id') != '-':
-          dev = {}
-          dev['id'] = d['Id']
-          dev['name'] = d['Name']
-          dev['type'] = d['DeviceType']
-          dev['type_code'] = d['DeviceTypeCode']
-          dev['playing'] = d['ContentPlaying']
-          dev['reg_date'] = isodate2str(d['RegistrationDate'])
-          dev['in_ssp'] = d['IsInSsp']
-          res.append(dev)
+        device_id = d.get('Id') or d.get('deviceId') or d.get('id')
+        if not device_id or device_id == '-':
+          continue
+        reg_date = d.get('RegistrationDate') or ''
+        try:
+          reg_date = isodate2str(reg_date)
+        except Exception:
+          pass
+        res.append({
+          'id': device_id,
+          'name': d.get('Name') or d.get('name') or 'Dispositivo',
+          'type': d.get('DeviceType') or d.get('deviceType') or '',
+          'type_code': d.get('DeviceTypeCode') or d.get('deviceTypeCode') or '',
+          'playing': d.get('ContentPlaying') or d.get('contentPlaying') or '',
+          'reg_date': reg_date,
+          'in_ssp': d.get('IsInSsp', d.get('isInSsp', False)),
+        })
       return res
 
+    def get_devices(self):
+      tokens = self.load_tokens()
+      access_token = tokens.get('accessToken_init') or self.account.get('access_token')
+      account_nbr = tokens.get('account_nbr') or self.account.get('id')
+      device_id = tokens.get('device_id_actual') or self.account.get('device_id')
+      if not access_token or not account_nbr:
+        return []
+      url = self.endpoints['devices'].format(ACCOUNTNUMBER=account_nbr)
+      try:
+        headers = self.signed_api_headers(
+          'GET', url, access_token, 'Bearer',
+          extra={
+            'Host': 'soterpe-pf.sve.video.telefonicaservices.com',
+            'X-Movistarplus-Deviceid': device_id,
+          })
+        response = self.api_request('GET', url, headers=headers, allow_redirects=True)
+        devices = self.normalize_devices(self.response_json(response))
+        self.update_token_device_types(devices)
+        return devices
+      except Exception as exc:
+        LOG('get_devices failed: {}'.format(exc))
+        return []
+
+    def update_token_device_types(self, devices):
+      tokens = self.load_tokens()
+      token_list = tokens.get('accessToken_init_lista', [])
+      if not token_list:
+        return
+      changed = False
+      by_id = {d.get('id'): d for d in devices}
+      for item in token_list:
+        device = by_id.get(item.get('device_id'))
+        if not device:
+          continue
+        if item.get('device_type') != device.get('type'):
+          item['device_type'] = device.get('type')
+          changed = True
+        if item.get('device_type_code') != device.get('type_code'):
+          item['device_type_code'] = device.get('type_code')
+          changed = True
+        if item.get('ssp') != device.get('in_ssp'):
+          item['ssp'] = device.get('in_ssp')
+          changed = True
+      if changed:
+        self.save_tokens(tokens)
+
     def register_device(self):
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      headers['x-movistarplus-deviceid'] = self.account['device_id']
-      #headers['x-movistarplus-ui'] = '2.36.30'
-      #headers['x-movistarplus-os'] = 'Linux88'
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = self.endpoints['activacion_dispositivo_cuenta_tk'].format(deviceType=self.dplayer, ACCOUNTNUMBER=self.account['id'], DEVICEID=self.account['device_id'])
-      response = self.net.session.post(url, headers=headers)
-      content = response.content.decode('utf-8')
-      return content
+      tokens = self.load_tokens()
+      token = tokens.get('access_token_login')
+      account_nbr = tokens.get('account_nbr')
+      device_id = tokens.get('device_id_actual') or self.account.get('device_id')
+      if not token or token_expired(token) or not account_nbr or not device_id:
+        return ''
+      return 'OK' if self.put_device_id(device_id, token, account_nbr) else ''
 
     def unregister_device(self):
       return self.delete_device(self.account['device_id'])
 
     def request_device_id(self):
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      #headers['x-movistarplus-ui'] = '2.36.30'
-      #headers['x-movistarplus-os'] = 'Linux88'
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = 'https://auth.dof6.com/movistarplus/{deviceType}/accounts/{ACCOUNTNUMBER}/devices/?qspVersion=ssp'
-      url = url.format(deviceType=self.dplayer, ACCOUNTNUMBER=self.account['id'])
-      #LOG(url)
-      response = self.net.session.post(url, headers=headers)
-      content = response.content.decode('utf-8')
-      return content.strip('"')
+      return uuid.uuid4().hex
 
-    #def generate_device_id(self):
-    #  import random
-    #  s = ''
-    #  for _ in range(0, 32): s += random.choice('abcdef0123456789')
-    #  return s
+    def is_protected_device(self, device):
+      device_type = device.get('type') or device.get('device_type') or ''
+      type_code = device.get('type_code') or device.get('device_type_code') or ''
+      return type_code in ['STB', 'STB_IPTV', 'IPTV'] or device_type in ['STB', 'STB_IPTV', 'IPTV']
 
     def delete_device(self, device_id):
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      headers['Authorization'] = 'bearer ' + self.account['access_token']
-      url = self.endpoints['eliminardipositivo'].format(ACCOUNTNUMBER=self.account['id'], DEVICEID=device_id)
-      response = self.net.session.delete(url, headers=headers)
-      content = response.content.decode('utf-8')
-      return content
+      tokens = self.load_tokens()
+      for device in self.get_devices():
+        if device.get('id') == device_id and self.is_protected_device(device):
+          return 'ERROR: no se puede eliminar un decodificador oficial.'
+      access_token = tokens.get('accessToken_init') or self.account.get('access_token')
+      account_nbr = tokens.get('account_nbr') or self.account.get('id')
+      if not access_token or not account_nbr:
+        return ''
+      url = self.endpoints['delete_device'].format(ACCOUNTNUMBER=account_nbr, DEVICEID=device_id)
+      try:
+        headers = self.signed_api_headers(
+          'DELETE', url, access_token, 'Bearer',
+          extra={'Host': 'soterpe-pf.sve.video.telefonicaservices.com'})
+        response = self.api_request('DELETE', url, headers=headers)
+        if response.status_code in (200, 204):
+          token_list = [
+            item for item in tokens.get('accessToken_init_lista', [])
+            if item.get('device_id') != device_id
+          ]
+          tokens['accessToken_init_lista'] = token_list
+          if tokens.get('device_id_actual') == device_id and token_list:
+            tokens['device_id_actual'] = token_list[0].get('device_id')
+            tokens['accessToken_init'] = token_list[0].get('accessToken_init')
+          self.save_tokens(tokens)
+        return response.content.decode('utf-8')
+      except Exception as exc:
+        LOG('delete_device failed: {}'.format(exc))
+        return str(exc)
 
     def rename_device(self, device_id, name):
-      headers = self.net.headers.copy()
-      headers['Authorization'] = 'bearer ' + self.account['access_token']
-      url = self.endpoints['nombrardispositivo'].format(ACCOUNTNUMBER=self.account['id'], DEVICEID=device_id)
-      response = self.net.session.put(url, headers=headers, json=name)
-      content = response.content.decode('utf-8')
-      return content
+      return ''
+
+    def clear_session(self):
+      return ''
+
+    def open_session(self, data, session_token=None, session_id=None):
+      return {'resultCode': 0, 'resultData': {'cToken': self.get_ssp_token()}}
 
     def delete_session_id(self, session_token, id = '0'):
       headers = self.net.headers.copy()
@@ -408,52 +602,196 @@ class Movistar(object):
     """
 
     def delete_session(self, device_id = None):
-      if device_id == None: device_id = self.account['device_id']
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      headers['Authorization'] = 'bearer ' + self.account['access_token']
-      url = self.endpoints['cerrarsesiondispositivo'].format(ACCOUNTNUMBER=self.account['id'], DEVICEID=device_id)
-      response = self.net.session.delete(url, headers=headers)
-      content = response.content.decode('utf-8')
-      return content
-
-    def get_cdntoken(self):
-      headers = self.net.headers.copy()
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = self.endpoints['renovacion_cdntoken2'].format(deviceType=self.dplayer, ACCOUNTNUMBER=self.account['id'])
-      data = self.net.post_data(url, None, headers)
-      if isinstance(data, dict):
-        return data.get('access_token')
       return ''
 
+    def get_cdntoken(self):
+      tokens = self.load_tokens()
+      tcdn_token = tokens.get('access_token_tcdn')
+      if tcdn_token and not token_expired(tcdn_token):
+        return tcdn_token
+
+      if token_expired(tokens.get('accessToken_init')):
+        self.renew_init_tokens(tokens)
+        tokens = self.load_tokens()
+
+      access_token = tokens.get('accessToken_init') or self.account.get('access_token')
+      account_nbr = tokens.get('account_nbr') or self.account.get('id')
+      if not access_token or not account_nbr:
+        return ''
+      try:
+        tcdn_token = self.request_tcdn_token(access_token, account_nbr)
+        if tcdn_token:
+          tokens['access_token_tcdn'] = tcdn_token
+          self.save_tokens(tokens)
+        return tcdn_token
+      except Exception as exc:
+        LOG('get_cdntoken failed: {}'.format(exc))
+        return ''
+
+    def usable_token_items(self, tokens):
+      items = []
+      current = tokens.get('device_id_actual')
+      if tokens.get('accessToken_init') and current:
+        items.append({
+          'device_id': current,
+          'accessToken_init': tokens.get('accessToken_init'),
+        })
+      for item in tokens.get('accessToken_init_lista', []):
+        if self.is_protected_device(item):
+          continue
+        if not item.get('device_id') or not item.get('accessToken_init'):
+          continue
+        if item.get('device_id') == current:
+          continue
+        items.append(item)
+      return items
+
+    def store_renewed_init_data(self, tokens, device_id, init_data):
+      access_token = init_data.get('accessToken')
+      if not access_token:
+        return False
+      tokens['device_id_actual'] = device_id
+      tokens['accessToken_init'] = access_token
+      tokens['legacyAccessToken_init'] = init_data.get('legacyAccessToken')
+      tokens['sspToken_init'] = init_data.get('sspToken')
+      tokens['init_data'] = init_data
+      token_list = tokens.setdefault('accessToken_init_lista', [])
+      found = False
+      for item in token_list:
+        if item.get('device_id') == device_id:
+          item['accessToken_init'] = access_token
+          item['expira'] = self.token_expire_string(access_token)
+          item['ultimo_uso'] = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+          item['ssp'] = bool(init_data.get('sspToken'))
+          found = True
+          break
+      if not found:
+        token_list.append({
+          'device_id': device_id,
+          'accessToken_init': access_token,
+          'fecha_obtencion': datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+          'expira': self.token_expire_string(access_token),
+          'ultimo_uso': datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+          'ssp': bool(init_data.get('sspToken')),
+          'device_type': 'Web',
+          'device_type_code': 'WP_DASH',
+        })
+      try:
+        tokens['access_token_tcdn'] = self.request_tcdn_token(
+          access_token, tokens.get('account_nbr'))
+      except Exception as exc:
+        LOG('tcdn refresh after init failed: {}'.format(exc))
+      self.save_tokens(tokens)
+      self.apply_tokens(tokens)
+      return True
+
+    def renew_init_tokens(self, tokens=None):
+      tokens = tokens or self.load_tokens()
+      account_nbr = tokens.get('account_nbr') or self.account.get('id')
+      if not account_nbr:
+        return False
+
+      for item in self.usable_token_items(tokens):
+        try:
+          init_data = self.request_init_data(
+            item.get('accessToken_init'), account_nbr, item.get('device_id'))
+          return self.store_renewed_init_data(tokens, item.get('device_id'), init_data)
+        except Exception as exc:
+          LOG('renew with accessToken_init failed for {}: {}'.format(
+            item.get('device_id'), exc))
+
+      login_token = tokens.get('access_token_login')
+      device_id = tokens.get('device_id_actual') or self.account.get('device_id')
+      if login_token and not token_expired(login_token) and device_id:
+        try:
+          if self.put_device_id(device_id, login_token, account_nbr):
+            init_data = self.request_init_data(login_token, account_nbr, device_id)
+            return self.store_renewed_init_data(tokens, device_id, init_data)
+        except Exception as exc:
+          LOG('renew with access_token_login failed: {}'.format(exc))
+
+      username = tokens.get('username')
+      password = tokens.get('password')
+      if username and not password:
+        stored_username, stored_password = self.load_credentials()
+        if stored_username == username:
+          password = stored_password
+      if username and password:
+        try:
+          device_id = device_id or uuid.uuid4().hex
+          login_token = self.request_login_token(username, password, device_id)
+          if self.put_device_id(device_id, login_token, account_nbr):
+            init_data = self.request_init_data(login_token, account_nbr, device_id)
+            tokens['access_token_login'] = login_token
+            return self.store_renewed_init_data(tokens, device_id, init_data)
+        except Exception as exc:
+          LOG('renew with stored credentials failed: {}'.format(exc))
+
+      return False
+
+    def add_new_device(self):
+      tokens = self.load_tokens()
+      username = tokens.get('username')
+      password = tokens.get('password')
+      if username and not password:
+        stored_username, stored_password = self.load_credentials()
+        if stored_username == username:
+          password = stored_password
+      account_nbr = tokens.get('account_nbr')
+      if not username or not password or not account_nbr:
+        return False, 'No hay credenciales guardadas para crear dispositivo.'
+      device_id = uuid.uuid4().hex
+      try:
+        login_token = self.request_login_token(username, password, device_id)
+        if not self.put_device_id(device_id, login_token, account_nbr):
+          return False, 'No se pudo registrar el dispositivo.'
+        init_data = self.request_init_data(login_token, account_nbr, device_id)
+        tokens['access_token_login'] = login_token
+        self.store_renewed_init_data(tokens, device_id, init_data)
+        return True, device_id
+      except Exception as exc:
+        LOG('add_new_device failed: {}'.format(exc))
+        return False, str(exc)
+
+    def sync_devices(self):
+      devices = self.get_devices()
+      tokens = self.load_tokens()
+      if not devices or not tokens:
+        return False, 'No hay dispositivos para sincronizar.'
+      known = {item.get('device_id'): item for item in tokens.get('accessToken_init_lista', [])}
+      for device in devices:
+        if self.is_protected_device(device) or device.get('id') in known:
+          continue
+        tokens.setdefault('accessToken_init_lista', []).append({
+          'device_id': device.get('id'),
+          'accessToken_init': '',
+          'fecha_obtencion': '',
+          'expira': 'Desconocida',
+          'ultimo_uso': '',
+          'ssp': device.get('in_ssp', False),
+          'device_type': device.get('type', ''),
+          'device_type_code': device.get('type_code', ''),
+        })
+      api_ids = set([d.get('id') for d in devices])
+      tokens['accessToken_init_lista'] = [
+        item for item in tokens.get('accessToken_init_lista', [])
+        if item.get('device_id') in api_ids or item.get('accessToken_init')
+      ]
+      self.save_tokens(tokens)
+      self.update_token_device_types(devices)
+      return True, '{} dispositivos sincronizados.'.format(len(devices))
+
     def get_session_token(self):
-      data = {"accountNumber": self.account['id'],
-              "sessionUserProfile": self.account['profile_id'],
-              "streamMiscellanea":"HTTPS",
-              "deviceType": self.device_code,
-              "deviceManufacturerProduct": self.manufacturer,
-              "streamDRM":"Widevine",
-              "streamFormat":"DASH",
-      }
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = self.endpoints['renovacion_hztoken'].format(deviceType=self.dplayer, DEVICEID=self.account['device_id'])
-      data = self.net.post_data(url, json.dumps(data), headers)
-      return data.get('homeZoneID')
+      return self.account.get('session_token', '')
 
     def get_ssp_token(self):
-      headers = self.net.headers.copy()
-      headers['Content-Type'] = 'application/json'
-      headers['Authorization'] = 'Bearer ' + self.account['access_token']
-      url = self.endpoints['renovacion_ssptoken'].format(deviceType=self.dplayer, ACCOUNTNUMBER=self.account['id'], DEVICEID=self.account['device_id'])
-      data = self.net.post_data(url, '', headers)
-      return data.get('access_token')
+      tokens = self.load_tokens()
+      if token_expired(tokens.get('sspToken_init')):
+        self.renew_init_tokens(tokens)
+        tokens = self.load_tokens()
+      return tokens.get('sspToken_init') or self.account.get('ssp_token', '')
 
     def update_session_token(self):
-      new_hz_token = self.get_session_token()
-      if new_hz_token:
-        self.account['session_token'] = new_hz_token
       return
 
     def get_profiles(self):
@@ -475,7 +813,11 @@ class Movistar(object):
     def change_profile(self, id):
       self.account['profile_id'] = id
       self.cache.save_file('profile_id.conf', self.account['profile_id'])
-      self.cache.remove_file('tokens.json')
+      tokens = self.load_tokens()
+      if tokens:
+        tokens['profile_id'] = id
+        if self.renew_init_tokens(tokens):
+          return
 
     def load_epg_data(self, date_str, duration=2, channels=''):
       demarcation = self.account['demarcation']
@@ -513,23 +855,35 @@ class Movistar(object):
       if 'error' in data: return epg
 
       for ch in data:
-        id = ch[0]['Canal']['CodCadenaTv']
+        if isinstance(ch, dict):
+          programs = ch.get('Pases') or ch.get('Programas') or ch.get('programs') or []
+          if not programs and ch.get('FechaHoraInicio'):
+            programs = [ch]
+          channel_data = ch.get('Canal') or ch
+        else:
+          programs = ch
+          channel_data = ch[0].get('Canal', {}) if ch else {}
+        id = (channel_data.get('CodCadenaTv') or channel_data.get('ChannelId') or
+              channel_data.get('id') or channel_data.get('CasId'))
+        if not id: continue
         if not id in epg: epg[id] = []
-        for p in ch:
+        for p in programs:
           pr = {}
+          if not p.get('FechaHoraInicio') or not p.get('FechaHoraFin'):
+            continue
           pr['start'] = int(p['FechaHoraInicio'])
           pr['end'] = int(p['FechaHoraFin'])
           pr['start_str'] = timestamp2str(pr['start'])
           pr['end_str'] = timestamp2str(pr['end'])
           pr['date_str'] = timestamp2str(pr['start'], '%a %d %H:%M')
-          pr['desc1'] = p['Titulo']
+          pr['desc1'] = p.get('Titulo') or p.get('Nombre') or ''
           pr['desc2'] = ''
           if 'TituloHorLinea2' in p:
             pr['desc2'] = p['TituloHorLinea2']
-          pr['show_id'] = p['ShowId']
+          pr['show_id'] = p.get('ShowId') or p.get('Id') or ''
           if 'SerialId' in p:
             pr['serie_id'] = p['SerialId']
-          pr['id'] = p['Id']
+          pr['id'] = p.get('Id') or pr['show_id']
           #if 'links' in p: pr['links'] = p['links']
           epg[id].append(pr)
 
@@ -602,11 +956,13 @@ class Movistar(object):
         ch['info']['plot'] = plot
 
     def is_subscribed_channel(self, products):
+      if not products:
+        return True
       for e in self.entitlements['activePackages']:
-        if e['name'] in products:
+        if isinstance(e, dict) and e.get('name') in products:
            return True
       for e in self.entitlements['activePurchases']:
-        if e['name'] in products:
+        if isinstance(e, dict) and e.get('name') in products:
            return True
       for e in self.entitlements['tvRights']:
         if e in products:
@@ -628,10 +984,12 @@ class Movistar(object):
       if content:
         data = json.loads(content)
       else:
-        url = self.endpoints['canales'].format(deviceType='webplayer', profile=profile, mdrm='true', demarcation=demarcation)
-        if self.quality == 'UHD': url += '&filterQuality=UHD'
-        #LOG(url)
-        data = self.net.load_data(url)
+        url = self.endpoints['epg_nueva']
+        data = self.net.load_data(url, self.new_api_headers(None))
+        if 'error' in data:
+          url = self.endpoints['canales'].format(deviceType='webplayer', profile=profile, mdrm='true', demarcation=demarcation)
+          if self.quality == 'UHD': url += '&filterQuality=UHD'
+          data = self.net.load_data(url)
         if not 'error' in data:
           self.cache.save_file(cache_filename, json.dumps(data, ensure_ascii=False))
 
@@ -639,21 +997,26 @@ class Movistar(object):
       if 'error' in data: return res
 
       for c in data:
+        name = (c.get('Nombre') or c.get('Name') or '').strip()
+        if not name:
+          continue
+        channel_id = c.get('CodCadenaTv') or c.get('ChannelId') or c.get('id') or c.get('CasId') or name
+        channel_id = str(channel_id)
         t = {}
         t['info'] = {}
         t['art'] = {}
         t['type'] = 'movie'
         t['stream_type'] = 'tv'
         t['info']['mediatype'] = 'movie'
-        t['channel_name'] = c['Nombre'].strip()
+        t['channel_name'] = name
         t['info']['title'] = str(c.get('Dial', '0')) +'. ' + t['channel_name']
-        t['id'] = c['CodCadenaTv']
+        t['id'] = channel_id
         t['cas_id'] = c.get('CasId')
         #if add_epg_info:
         #  t['desc1'] = c['Nombre']
         #  t['desc2'] = ''
         t['dial'] = c.get('Dial', '0')
-        t['url'] = c['PuntoReproduccion']
+        t['url'] = c.get('PuntoReproduccion') or c.get('UrlVideo') or ''
         if 'Logo' in c:
           t['art']['icon'] = t['art']['thumb'] = t['art']['poster'] = c['Logo']
         elif 'Logos' in c:
@@ -1384,6 +1747,104 @@ class Movistar(object):
       res = '#EXTM3U\n## Movistar+\n{}'.format(''.join(items))
       with io.open(filename, 'w', encoding='utf-8', newline='') as handle:
         handle.write(res)
+
+    def read_m3u_groups(self, ini_filename):
+      if not ini_filename or not os.path.exists(ini_filename):
+        return {}, {}
+      try:
+        import configparser
+        parser = configparser.ConfigParser()
+        parser.optionxform = str
+        parser.read(ini_filename, encoding='utf-8')
+        groups = {}
+        if parser.has_section('grupos'):
+          for key, value in parser.items('grupos'):
+            for channel in [c.strip() for c in value.split(',') if c.strip()]:
+              groups[channel] = key
+        keys = {}
+        if parser.has_section('kid_key'):
+          for key, value in parser.items('kid_key'):
+            pairs = []
+            for pair in value.split():
+              if ':' in pair:
+                pairs.append(pair.strip())
+            if pairs:
+              keys[key] = ','.join(pairs)
+        return groups, keys
+      except Exception as exc:
+        LOG('read_m3u_groups failed: {}'.format(exc))
+        return {}, {}
+
+    def generate_m3u(self, ini_filename=None):
+      token = self.get_cdntoken()
+      if not token:
+        return False, 'No se pudo obtener token TCDN.'
+      groups, keys = self.read_m3u_groups(ini_filename)
+      channels = self.get_channels()
+      if not channels:
+        return False, 'No se encontraron canales.'
+
+      output = os.path.join(self.cache.config_directory, 'movistarplus_token.m3u')
+      lines = ['#EXTM3U catchup-type="default" catchup-days="40"\n']
+      headers = 'X-TCDN-token={}&User-Agent={}&Origin=https://ver.movistarplus.es&Referer=https://ver.movistarplus.es/'.format(
+        token, useragent)
+      for channel in channels:
+        name = channel.get('channel_name') or channel['info'].get('title')
+        group = groups.get(name, 'Movistar+')
+        logo = channel.get('art', {}).get('icon', '')
+        url = channel.get('url', '')
+        if not url:
+          continue
+        lines.append('#EXTINF:-1 tvg-id="{id}" tvg-name="{name}" tvg-logo="{logo}" group-title="{group}",{name}\n'.format(
+          id=channel.get('id', name), name=name, logo=logo, group=group))
+        lines.append('#KODIPROP:inputstream=inputstream.adaptive\n')
+        lines.append('#KODIPROP:inputstream.adaptive.manifest_type=mpd\n')
+        lines.append('#KODIPROP:inputstream.adaptive.manifest_headers={}\n'.format(headers))
+        if keys.get(name):
+          lines.append('#KODIPROP:inputstream.adaptive.drm_legacy=org.w3.clearkey|{}\n'.format(keys[name]))
+        lines.append('{}\n\n'.format(url))
+
+      with io.open(output, 'w', encoding='utf-8', newline='') as handle:
+        handle.write(''.join(lines))
+      return True, 'M3U generado: {}'.format(output)
+
+    def needs_hcsmno(self, cas_id):
+      if not cas_id:
+        return False
+      cache_filename = 'hcsmno_{}.conf'.format(cas_id)
+      cached = self.cache.load_file(cache_filename)
+      if cached in ['0', '1']:
+        return cached == '1'
+
+      token = self.get_cdntoken()
+      if not token:
+        return False
+
+      fake_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+      start = '{}T00:00:00Z'.format(fake_date)
+      end = '{}T01:00:00Z'.format(fake_date)
+      headers = self.net.headers.copy()
+      headers['X-TCDN-Token'] = token
+
+      old_url = 'https://stover-wp0.cdn.telefonica.com/{}/vxfmt=dp/Manifest.mpd?device_profile=DASH_TV_PLAYREADY&start_time={}&end_time={}'.format(
+        cas_id, start, end)
+      new_url = 'https://stoverhcsmno-wp0.cdn.telefonica.com/{}/vxfmt=dp/Manifest.mpd?device_profile=DASH_TV_PLAYREADY&start_time={}&end_time={}'.format(
+        cas_id, start, end)
+      try:
+        response = self.net.session.get(old_url, headers=headers, allow_redirects=True, timeout=10)
+        if response.status_code in [200, 302]:
+          self.cache.save_file(cache_filename, '0')
+          return False
+      except Exception as exc:
+        LOG('old catchup domain check failed: {}'.format(exc))
+      try:
+        response = self.net.session.get(new_url, headers=headers, allow_redirects=True, timeout=10)
+        if response.status_code in [200, 302]:
+          self.cache.save_file(cache_filename, '1')
+          return True
+      except Exception as exc:
+        LOG('hcsmno domain check failed: {}'.format(exc))
+      return False
 
     def export_epg(self, date=None, duration=2):
       if sys.version_info[0] >= 3:

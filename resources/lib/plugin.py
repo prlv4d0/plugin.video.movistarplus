@@ -23,7 +23,7 @@ else:
   from urllib import urlencode, quote_plus
   from urlparse import parse_qsl
 
-from .log import LOG
+from .log import LOG, INFO, ERROR
 from .movistar import *
 from .addon import *
 from .gui import *
@@ -53,7 +53,7 @@ def play(params):
   channel_id = params['id']
   stype = params['stype']
 
-  token = m.account['ssp_token']
+  token = m.get_ssp_token()
 
   import inputstreamhelper
   is_helper = inputstreamhelper.Helper('mpd', drm='com.widevine.alpha')
@@ -100,8 +100,9 @@ def play(params):
     from datetime import datetime
     start = datetime.utcfromtimestamp(int(params['start_time']))
     end = datetime.utcfromtimestamp(int(params['end_time']))
-    catchup_url = 'https://stover-wp0.cdn.telefonica.com/{cas_id}/vxfmt=dp/Manifest.mpd?device_profile=DASH_TV_WIDEVINE&start_time={start_time}&end_time={end_time}'
-    url = catchup_url.format(cas_id=params['cas_id'], start_time=start.strftime('%Y-%m-%dT%H:%M:%SZ'), end_time=end.strftime('%Y-%m-%dT%H:%M:%SZ'))
+    catchup_domain = 'stoverhcsmno-wp0' if m.needs_hcsmno(params['cas_id']) else 'stover-wp0'
+    catchup_url = 'https://{domain}.cdn.telefonica.com/{cas_id}/vxfmt=dp/Manifest.mpd?device_profile=DASH_TV_WIDEVINE&start_time={start_time}&end_time={end_time}'
+    url = catchup_url.format(domain=catchup_domain, cas_id=params['cas_id'], start_time=start.strftime('%Y-%m-%dT%H:%M:%SZ'), end_time=end.strftime('%Y-%m-%dT%H:%M:%SZ'))
     LOG('url from capchup: {}'.format(url))
 
 
@@ -123,10 +124,7 @@ def play(params):
   manifest_headers = 'User-Agent=' + useragent
 
   if True: #stype in ['tv', 'u7d', 'rec']:
-    cdn_token = m.cache.load('cdn.conf', 60)
-    if not cdn_token:
-      cdn_token = m.get_cdntoken()
-      m.cache.save_file('cdn.conf', cdn_token)
+    cdn_token = m.get_cdntoken()
     #LOG('cdn_token: {}'.format(cdn_token))
     manifest_headers += '&x-tcdn-token=' + cdn_token
 
@@ -245,6 +243,7 @@ def play(params):
       last_time = 0 #time.time()
       window = xbmcgui.Window(12005)
       label = xbmcgui.ControlLabel(0, 0, 400, 20, m.account['id'], textColor='0xFFFFFFFF', alignment=6)
+      label_added = False
     from .player import MyPlayer
     player = MyPlayer()
     monitor = xbmc.Monitor()
@@ -262,9 +261,20 @@ def play(params):
           pos_x = w-label.getWidth()-60
           pos_y = h-200
           label.setPosition(pos_x, pos_y)
-          window.addControl(label)
+          if not label_added:
+            window.addControl(label)
+            label_added = True
           time.sleep(20)
-          window.removeControl(label)
+          try:
+            window.removeControl(label)
+          except RuntimeError:
+            pass
+          label_added = False
+    if is_sport_channel and label_added:
+      try:
+        window.removeControl(label)
+      except RuntimeError:
+        pass
     if session_opened:
       d = m.delete_session()
       LOG('Delete session: d: {}'.format(d))
@@ -425,11 +435,8 @@ def list_devices(params):
     elif params['name'] == 'delete':
       LOG('Removing device {}'.format(params['id']))
       m.delete_device(params['id'])
-      if params['id'] == m.account['device_id']:
-        LOG('Registering device')
-        m.register_device()
 
-    xbmc.executebuiltin("Container.Refresh")
+    action_done(get_url(action='devices'))
     return
 
   open_folder(addon.getLocalizedString(30108)) # Devices
@@ -446,14 +453,37 @@ def list_devices(params):
     remove_action = get_url(action='devices', id=d['id'], name='delete')
     cm = [(addon.getLocalizedString(30150), "RunPlugin(" + close_action + ")"),
           (addon.getLocalizedString(30151), "RunPlugin(" + remove_action + ")")]
-    if d['type_code'] == 'WP':
-      cm.insert(0, (addon.getLocalizedString(30152), "RunPlugin(" + select_action + ")"))
-      default_action = select_action
-    else:
-      default_action = close_action
+    cm.insert(0, (addon.getLocalizedString(30152), "RunPlugin(" + select_action + ")"))
+    default_action = select_action
     add_menu_option(name, default_action, cm)
 
   close_folder(cacheToDisc=False)
+
+def renew_tokens():
+  ok = m.renew_init_tokens()
+  if ok:
+    m.get_cdntoken()
+    show_notification('Tokens renovados', xbmcgui.NOTIFICATION_INFO)
+  else:
+    show_notification('No se pudieron renovar los tokens')
+  action_done(_url)
+
+def sync_devices():
+  ok, message = m.sync_devices()
+  show_notification(message, xbmcgui.NOTIFICATION_INFO if ok else xbmcgui.NOTIFICATION_ERROR)
+  action_done()
+
+def add_device():
+  ok, message = m.add_new_device()
+  show_notification('Dispositivo añadido: {}'.format(message) if ok else message,
+                    xbmcgui.NOTIFICATION_INFO if ok else xbmcgui.NOTIFICATION_ERROR)
+  action_done()
+
+def generate_m3u():
+  filename = xbmcgui.Dialog().browseSingle(1, 'Selecciona archivo INI M3U', '', '.ini')
+  ok, message = m.generate_m3u(filename) if filename else (False, 'Operación cancelada')
+  show_notification(message, xbmcgui.NOTIFICATION_INFO if ok else xbmcgui.NOTIFICATION_ERROR)
+  action_done()
 
 def list_profiles(params):
   LOG('list_profiles: params: {}'.format(params))
@@ -618,11 +648,21 @@ def delete_recording(id, name):
 def clear_session():
   m.delete_session_files()
 
+def action_done(refresh_url=None):
+  try:
+    close_folder(cacheToDisc=False)
+  except Exception as exc:
+    ERROR('action_done close_folder failed: {}'.format(exc))
+  if refresh_url:
+    xbmc.executebuiltin('Container.Update({},replace)'.format(refresh_url))
+
 def logout():
   clear_session()
   m.cache.remove_file('auth.key')
+  action_done(get_url(action='accounts'))
 
 def login():
+  INFO('plugin login action started')
   def ask_credentials(username='', password=''):
     username = input_window(addon.getLocalizedString(30163), username) # Username
     if username:
@@ -639,43 +679,50 @@ def login():
 
   username, password = ask_credentials(username, password)
   if username:
-    if store_credentials:
-      m.save_credentials(username, password)
-    success, _ = m.login(username, password)
+    INFO('plugin login credentials entered')
+    success, message = m.login(username, password)
     if success:
-      clear_session()
+      if store_credentials:
+        m.save_credentials(username, password)
+      show_notification(addon.getLocalizedString(30165), xbmcgui.NOTIFICATION_INFO)
+      action_done(_url)
     else:
-      show_notification(addon.getLocalizedString(30166)) # Failed
+      ERROR('plugin login failed: {}'.format(message))
+      show_notification('{}: {}'.format(addon.getLocalizedString(30166), message[:80])) # Failed
+      action_done()
+  else:
+    INFO('plugin login cancelled before credentials')
+    action_done()
 
 def login_with_key():
   filename = xbmcgui.Dialog().browseSingle(1, addon.getLocalizedString(30182), '', '.key')
   if filename:
     m.install_key_file(filename)
     clear_session()
+  action_done()
 
 def export_key():
   directory = xbmcgui.Dialog().browseSingle(0, addon.getLocalizedString(30185), '')
   if directory:
     m.export_key_file(directory + 'movistarplus.key')
+  action_done()
 
 def import_credentials():
   filename = xbmcgui.Dialog().browseSingle(1, addon.getLocalizedString(30193), '', '.json')
   if filename:
     m.import_credentials(filename)
+  action_done()
 
 def export_credentials():
   directory = xbmcgui.Dialog().browseSingle(0, addon.getLocalizedString(30194), '')
   if directory:
     m.export_credentials(os.path.join(directory, 'credenciales.json'))
+  action_done()
 
 def select_account(id, name):
   m.switch_account(id)
   open_folder(name)
   add_menu_option(addon.getLocalizedString(30183), get_url(action='login')) # Login with username
-  if addon.getSettingBool('enable_key_login'):
-    add_menu_option(addon.getLocalizedString(30181), get_url(action='login_with_key')) # Login with key
-    if os.path.exists(os.path.join(m.cache.config_directory, 'auth.key')):
-      add_menu_option(addon.getLocalizedString(30184), get_url(action='export_key')) # Export key
   add_menu_option(addon.getLocalizedString(30150), get_url(action='logout')) # Close session
   add_menu_option(addon.getLocalizedString(30196), get_url(action='import_credentials'))
   if os.path.exists(os.path.join(m.cache.config_directory, 'credentials.json')):
@@ -702,9 +749,6 @@ def list_accounts(params):
     add_menu_option(display_name, get_url(action='select_account', id=account['id'], name=name))
   add_menu_option(addon.getLocalizedString(30161), get_url(action='accounts', name='new_account')) # Add new
   close_folder(cacheToDisc=False)
-
-  if params.get('name') == 'new_account':
-    xbmc.executebuiltin('Container.Update({},replace)'.format(xbmc.getInfoLabel('Container.FolderPath')))
 
 def iptv(params):
   LOG('iptv: params: {}'.format(params))
@@ -795,6 +839,14 @@ def router(paramstring):
       add_videos(addon.getLocalizedString(30104), 'movies', channels)
     elif params['action'] == 'devices':
       list_devices(params)
+    elif params['action'] == 'renew_tokens':
+      renew_tokens()
+    elif params['action'] == 'sync_devices':
+      sync_devices()
+    elif params['action'] == 'add_device':
+      add_device()
+    elif params['action'] == 'generate_m3u':
+      generate_m3u()
     elif params['action'] == 'profiles':
       list_profiles(params)
     elif params['action'] == 'login_with_key':
@@ -865,6 +917,10 @@ def router(paramstring):
       add_menu_option(addon.getLocalizedString(30112), get_url(action='search'), icon='search.png') # Search
       add_menu_option(addon.getLocalizedString(30180), get_url(action='profiles'), icon='profiles.png') # Profiles
       add_menu_option(addon.getLocalizedString(30108), get_url(action='devices'), icon='devices.png') # Devices
+      add_menu_option('Renovar tokens', get_url(action='renew_tokens'))
+      add_menu_option('Sincronizar dispositivos', get_url(action='sync_devices'))
+      add_menu_option('Añadir dispositivo', get_url(action='add_device'))
+      add_menu_option('Generar M3U', get_url(action='generate_m3u'))
     elif m.expired_access_token:
       show_notification(addon.getLocalizedString(30208))
 
